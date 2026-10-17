@@ -1,14 +1,15 @@
 """MissionPulse Backend API.
 
 FastAPI application providing telemetry ingestion, time-series analytics,
-and historical data retrieval backed by Tiger Cloud TimescaleDB.
+historical data retrieval, and real-time WebSocket broadcasting backed by
+Tiger Cloud TimescaleDB.
 """
 
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import psycopg2
@@ -25,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="MissionPulse Telemetry API",
-    description="Simulated rocket telemetry ingestion and analytics powered by TimescaleDB.",
+    description="Simulated rocket telemetry ingestion, analytics, and live streaming powered by TimescaleDB.",
     version="1.0.0",
 )
 
@@ -37,6 +38,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================================
+# WebSocket Connection Manager
+# ============================================================================
+
+
+class ConnectionManager:
+    """Manages active WebSocket client connections for real-time telemetry streaming."""
+
+    def __init__(self) -> None:
+        # Maps active WebSocket connection to optional mission_id filter
+        self.active_connections: Dict[WebSocket, Optional[str]] = {}
+
+    async def connect(self, websocket: WebSocket, mission_id: Optional[str] = None) -> None:
+        """Accept new WebSocket connection and track optional mission filter."""
+        await websocket.accept()
+        self.active_connections[websocket] = mission_id
+        logger.info(
+            "WebSocket client connected (mission_filter=%s). Active connections: %d",
+            mission_id,
+            len(self.active_connections),
+        )
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        """Remove a disconnected WebSocket client."""
+        if websocket in self.active_connections:
+            del self.active_connections[websocket]
+            logger.info("WebSocket client disconnected. Active connections: %d", len(self.active_connections))
+
+    async def broadcast(self, message: Dict[str, Any]) -> None:
+        """Broadcast telemetry message to all connected clients respecting filters."""
+        disconnected_clients: List[WebSocket] = []
+        for ws, filter_mission_id in list(self.active_connections.items()):
+            # If no filter is set or if mission_id matches, send to client
+            if filter_mission_id is None or filter_mission_id == message.get("mission_id"):
+                try:
+                    await ws.send_json(message)
+                except Exception as err:
+                    logger.warning("Error transmitting to WebSocket client, removing: %s", err)
+                    disconnected_clients.append(ws)
+
+        for ws in disconnected_clients:
+            self.disconnect(ws)
+
+
+manager = ConnectionManager()
 
 
 # ============================================================================
@@ -122,11 +170,12 @@ def health_check() -> Dict[str, str]:
     summary="Ingest Telemetry Data",
     response_description="Confirmation of stored telemetry record",
 )
-def ingest_telemetry(payload: TelemetryPayload) -> Dict[str, Any]:
+async def ingest_telemetry(payload: TelemetryPayload) -> Dict[str, Any]:
     """Ingest a single telemetry record and store it into the TimescaleDB hypertable.
 
     - Validates payload structure and types with Pydantic.
     - Executes a parameterized SQL INSERT.
+    - Broadcasts the new telemetry point to all active WebSocket clients.
     - Safely handles errors without leaking credentials.
     """
     insert_sql = """
@@ -169,6 +218,22 @@ def ingest_telemetry(payload: TelemetryPayload) -> Dict[str, Any]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while storing telemetry.",
         )
+
+    # Consistent JSON message matching existing telemetry schema
+    telemetry_message = {
+        "timestamp": payload.timestamp.isoformat(),
+        "mission_id": payload.mission_id,
+        "elapsed_seconds": payload.elapsed_seconds,
+        "altitude": payload.altitude,
+        "velocity": payload.velocity,
+        "acceleration": payload.acceleration,
+        "temperature": payload.temperature,
+        "pressure": payload.pressure,
+        "flight_phase": payload.flight_phase,
+    }
+
+    # Broadcast to connected WebSocket clients
+    await manager.broadcast(telemetry_message)
 
     return {
         "status": "success",
@@ -384,3 +449,32 @@ def get_historical_telemetry(
         offset=offset,
         data=records,
     )
+
+
+# ============================================================================
+# WebSocket Real-Time Endpoint
+# ============================================================================
+
+
+@app.websocket("/ws/telemetry")
+async def websocket_telemetry(websocket: WebSocket, mission_id: Optional[str] = None):
+    """Real-time telemetry streaming WebSocket endpoint.
+
+    Allows dashboard clients to receive live telemetry updates as soon as
+    they are successfully ingested into the database.
+
+    Supports optional mission_id query parameter to stream updates for a
+    specific mission, or streams all missions if omitted.
+    """
+    await manager.connect(websocket, mission_id=mission_id)
+    try:
+        while True:
+            # Keep connection alive and accept client pings or control messages
+            data = await websocket.receive_text()
+            if data.strip().lower() == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as err:
+        logger.debug("WebSocket client disconnected or encountered error: %s", err)
+        manager.disconnect(websocket)
