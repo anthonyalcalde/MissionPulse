@@ -1,7 +1,13 @@
 .env
 .env.*
 !.env.example
+!.env.frontend.example
 .venv/
+.pytest_cache/
+.coverage
+node_modules/
+dist/
+*.tsbuildinfo
 __pycache__/
 *.pyc
 

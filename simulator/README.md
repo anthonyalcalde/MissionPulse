@@ -1,16 +1,17 @@
 # MissionPulse simulator
 
-Python 3.10+; standard library only. Copy `simulator/` into the shared repository root. No backend, database, or frontend files are included or modified.
+Python 3.10+; the flight model uses only the standard library. Run commands from the MissionPulse repository root.
 
 ## Run from the repository root
 
 ```bash
 python -m simulator.demo --speed 5 --anomaly-at 15
 python -m simulator.demo --fast --mission-id mission_demo --start-time 2026-10-17T14:00:00Z > mission.jsonl
-python -m unittest discover -s simulator/tests -v
+python -m simulator.demo --mission-id mission_live --api-url http://localhost:8000 --speed 1
+python -m pytest simulator/tests -q
 ```
 
-The first command prints JSON readings in real time at 5x speed; the second writes a reproducible JSONL flight without delays. Stop with Ctrl+C. No installation is needed. Default output interval is 0.1 simulated seconds. Use `--dt` to change it. Each JSON line is one reading, not a JSON array. Messages about injection go to stderr.
+The first command prints JSON readings in real time at 5x speed; the second writes a reproducible JSONL flight without delays. The third sends readings sequentially to `POST /api/telemetry`; it requires the backend and database to be ready. Add `--fast` for an unpaced API demo (POSTs remain sequential), or `--retries N` to change the transient-error retry limit. Failed delivery exits with an error; the runner does not continue after dropping a record. Stop with Ctrl+C. Default output interval is 0.1 simulated seconds. Use `--dt` to change it. Each JSON line is one reading, not a JSON array. Messages about injection and ingestion progress go to stderr.
 
 ## Python interface
 
@@ -29,7 +30,7 @@ sim.reset(mission_id='mission_002')
 
 First `step()` auto-starts. `start()` can also explicitly start. Pause/stop freeze elapsed time; do not ingest repeated frozen readings. Stopping requires reset before restarting. Reset rewinds the RNG and time origin; provide a fresh mission ID and optionally a timezone-aware `start_time` for a new database mission. Reset without arguments is an exact replay. Speed changes runner pacing (`sleep = dt / speed`), not flight equations or timestamps. The default `step()` interval is 0.1; the demo explicitly passes the configured sample interval.
 
-All mutable simulator methods should be called by one owner/task. It is not thread-safe. The backend owns HTTP control endpoints and the task that calls `step()` and stores/broadcasts the result. Pausing should suspend that task's ingestion. Resume should resume the same mission. Timestamp = origin + simulated elapsed time; at accelerated speed it can be ahead of wall time. Pauses do not create gaps in simulated time.
+All mutable simulator methods should be called by one owner/task. It is not thread-safe. The repository demo runner owns pacing and optional sequential HTTP ingestion. Timestamp = origin + simulated elapsed time; at accelerated speed it can be ahead of wall time. Pauses do not create gaps in simulated time.
 
 ## Physics you can explain to judges
 
@@ -51,20 +52,12 @@ Default noise is zero for a clean demo. Set `SimulationConfig(noise_fraction=0.0
 
 `inject_anomaly` adds a configurable bias to one measured field for simulated seconds. It does not alter flight dynamics. Bias expires before the reading at its end time. Multiple active biases add. It can intentionally yield impossible sensor values. The dictionary keeps exactly the agreed telemetry keys, with no extra anomaly flag. Detecting and displaying alerts remains the backend/frontend owners' responsibility.
 
-## Backend handoff
+## Backend integration
 
-Each returned dictionary supplies all nine fields expected by the supplied `TelemetryPayload`: mission ID, UTC ISO 8601 timestamp, elapsed seconds, altitude (m), velocity (m/s), acceleration (m/s²), temperature (Celsius), pressure (**Pa**), lowercase flight phase. No direct Tiger Data or FastAPI dependency belongs here.
+Each returned dictionary supplies the request fields expected by `TelemetryPayload`: mission ID, UTC ISO 8601 timestamp, elapsed seconds, altitude (m), velocity (m/s), acceleration (m/s²), temperature (Celsius), pressure (**Pa**), lowercase flight phase. The optional HTTP bridge is in `simulator/ingest.py`; the simulator does not connect to the database directly.
 
-Person 1's ingestion handler can accept each dictionary at `POST /api/telemetry`; its code commits to the database before WebSocket broadcast. The backend teammate should build the runner around this simulator and expose the agreed start/pause/resume/reset/anomaly routes. Choose one ingestion path: either call the backend ingestion service internally or use a separate HTTP sender, never both for the same flight. This package deliberately does not add network calls or rewrite their backend.
+The demo runner posts each reading to `POST /api/telemetry`; the backend commits each record before WebSocket broadcast. Retrying a record is safe for the same `(mission_id, timestamp)` because the API uses an idempotent upsert. The runner has no start/pause/resume/reset HTTP controls; do not imply those controls exist.
 
-Review of the supplied API source (not a running server):
+The repository API implements ingestion, historical telemetry, time-bucket statistics, and a live telemetry WebSocket. Mission listing, dedicated downsampling, and simulation-control routes are not implemented. Statistics are TimescaleDB `time_bucket` aggregations, not LTTB downsampling. The API contract fixes pressure to Pa and enforces the documented lowercase flight phases.
 
-- POST ingestion, historical telemetry, time-bucket stats and WebSocket routes are present.
-- Mission list, downsampling and simulation controls are absent from that supplied file.
-- `/stats` returns `{mission_id, interval, total_buckets, data: [...]}`, not overall mission maxima/duration.
-- Historical telemetry is wrapped in `{mission_id, total_records, limit, offset, data: [...]}`.
-- The backend accepts free-text phases and says pressure may be Pa or kPa. This simulator consistently uses the agreed lowercase phases and Pa.
-
-## Verification and limits
-
-Seven standalone unittest cases pass locally: full-flight/contract, exact no-drag powered flight, controls, noise reproducibility/speed independence, sensor-only anomaly expiry, timestep convergence, invalid input rejection. No database credentials, full backend checkout, or live service were supplied. No Tiger Data insertion, frontend delivery, or control endpoint behavior has been tested or claimed.
+`python -m unittest discover -s simulator/tests -v` runs the standard-library physics tests. The pytest suite also covers the HTTP bridge's request schema, retry behavior, and explicit failures. API delivery tests in `backend/tests` mock database access; they do not establish live database or Tiger Data connectivity.
